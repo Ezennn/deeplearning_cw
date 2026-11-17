@@ -69,13 +69,6 @@ parser.add_argument(
 )
 
 
-    
-class ImageShape(NamedTuple):
-    height: int
-    width: int
-    channels: int
-
-
 if torch.cuda.is_available():
     DEVICE = torch.device("cuda")
 else:
@@ -131,84 +124,91 @@ def main(args):
 
     summary_writer.close()
 
-class Attention(nn.Module):
-    def __init__(self, dim=192, num_heads=1):
+# class Attention(nn.Module):
+#     def __init__(self, dim=192, num_heads=1):
+#         super().__init__()
+#         self.num_heads = num_heads
+#         self.head_dim = dim // num_heads
+#         self.scale = self.head_dim ** -0.5
+
+#         self.qkv = nn.Linear(dim, dim * 3, bias=False)
+
+#         self.proj = nn.Linear(dim, dim)
+
+#     def forward(self, x):
+#         B, S, D = x.shape
+
+#         qkv = self.qkv(x).reshape(B, S, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+#         q, k, v = qkv[0], qkv[1], qkv[2]
+
+#         # TASK 12.1: Scale queries
+#         q = q * self.scale
+
+#         # TASK 12.2: Multiply queries by transposed keys
+#         attn = q @ k.transpose(-2, -1)
+
+#         # TASK 12.3: Apply softmax
+#         attn = F.softmax(attn, dim=-1)
+
+#         # TASK 12.4: Multiply attention by values and concatenate heads
+#         x = attn @ v
+#         x = x.transpose(1, 2).reshape(B, S, D)
+#         x = self.proj(x)
+#         return x
+
+class AudioTextTransformer(nn.Module):
+    def __init__(
+        self,
+        audio_dim,
+        text_dim,
+        d_model=256,
+        num_heads=4,
+        mlp_dim=512,
+        dropout=0.1
+    ):
         super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.scale = self.head_dim ** -0.5
-
-        self.qkv = nn.Linear(dim, dim * 3, bias=False)
-
-        self.proj = nn.Linear(dim, dim)
-
-    def forward(self, x):
-        B, S, D = x.shape
-
-        qkv = self.qkv(x).reshape(B, S, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
-
-        # TASK 12.1: Scale queries
-        q = q * self.scale
-
-        # TASK 12.2: Multiply queries by transposed keys
-        attn = q @ k.transpose(-2, -1)
-
-        # TASK 12.3: Apply softmax
-        attn = F.softmax(attn, dim=-1)
-
-        # TASK 12.4: Multiply attention by values and concatenate heads
-        x = attn @ v
-        x = x.transpose(1, 2).reshape(B, S, D)
-        x = self.proj(x)
-        return x
-
-class CIFAR_Transformer(nn.Module):
-    def __init__(self, height: int, width: int, channels: int, patch_size: tuple[int, int], class_count: int, n_heads: int=1, n_layers: int = 2):
-        super().__init__()
-        assert width % patch_size[0] == 0 and height % patch_size[1] == 0
-        self.class_count = class_count
-        self.n_heads = n_heads
-        self.patch_size = patch_size
-        self.unfold = nn.Unfold(kernel_size=patch_size, stride=patch_size)
-        d_model = channels * patch_size[0] * patch_size[1]
-
-        self.cls_token = nn.Parameter(torch.randn(1, 1, d_model))
-
-        num_patches = (height // patch_size[0]) * (width // patch_size[1])
-        self.pos_embedding = nn.Parameter(
-            torch.randn(1, num_patches + 1, d_model)
+        self.audio_projection = nn.Sequential(
+            nn.Linear(audio_dim, d_model),
+            nn.GELU(),
+            nn.LayerNorm(d_model)
         )
-        self.layers = nn.ModuleList([
-            nn.TransformerEncoderLayer(d_model=d_model, nhead=n_heads, batch_first=True)
-            for _ in range(n_layers)
-        ])
         
-        self.encoder = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=n_heads, batch_first=True
+        self.text_projection = nn.Sequential(
+            nn.Linear(text_dim, d_model),
+            nn.GELU(),
+            nn.LayerNorm(d_model)            
         )
-        self.fc1 = nn.Linear(d_model, 100)
-        self.fc2 = nn.Linear(100, class_count)
-        #TASKS 2, 3.1, 7, 8, 9.1, 11.1
- 
-
-
-    def forward(self, images: torch.Tensor) -> torch.Tensor:
-        #TASKS 1, 2, 3.2, 7, 8, 9.2, 10, 11.2
-        x = patchify(images, self.patch_size[0], self.patch_size[1])   # (B, 16, 192)
-
-        # Task 9.2: prepend CLS token
-        cls = self.cls_token.expand(x.shape[0], -1, -1)                # (B, 1, 192)
-
         
-        x = torch.cat([cls, x], dim=1) 
-        x = x + self.pos_embedding
-        for layer in self.layers:
-            x = layer(x)
-        x = x[:, 0, :]    
-        x = F.relu(self.fc1(x)) 
-        x = self.fc2(x)
-        return x
+        self.transformer = nn.TransformerEncoderLayer(
+            d_model = d_model,
+            nhead = num_heads,
+            dim_feedforward = mlp_dim,
+            dropout = dropout,
+            activation = 'gelu',
+            batch_first = True,
+            norm_first = False
+        )
+        
+        self.classifier = nn.Sequential(
+            nn.Linear(d_model, 128),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(128, 2) 
+        )
+    
+    def forward(self, audio_input, text_input):
+        audio = self.audio_projection(audio_input)
+        text = self.text_projection(text_input)
+        audio = audio.unsqueeze(1)
+        
+        x = torch.cat((audio, text), dim=1)
+        x = self.transformer(x)
+        
+        #Mean pooling
+        x = x.mean(dim=1)
+        output = self.classifier(x)
+        return output
+    
 
 
 class Trainer:
@@ -248,22 +248,27 @@ class Trainer:
         for epoch in range(start_epoch, epochs):
             self.model.train()
             data_load_start_time = time.time()
-            for batch, labels in self.train_loader:
-                batch = batch.to(self.device)
+            for audio, text, labels in self.train_loader:
+                audio = audio.to(self.device)
+                text = text.to(self.device)
                 labels = labels.to(self.device)
+                
+                
                 data_load_end_time = time.time()
 
 
-                logits = self.model.forward(batch)
+                logits = self.model.forward(audio, text)
 
                 #TASK 4 //done
 
                 loss = self.criterion(logits, labels)
+                
+                self.optimizer.zero_grad()
 
                 loss.backward()
 
                 self.optimizer.step()
-                self.optimizer.zero_grad()
+                
 
                 with torch.no_grad():
                     preds = logits.argmax(-1)
@@ -386,12 +391,6 @@ def get_summary_writer_log_dir(args: argparse.Namespace) -> str:
             return str(tb_log_dir)
         i += 1
     return str(tb_log_dir)
-
-
-def patchify(batch: torch.Tensor, x_size: int, y_size: int):
-    #TASK 1
-    unfold = nn.Unfold(kernel_size=(x_size, y_size), stride=(x_size, y_size))
-    return unfold(batch).transpose(1,2)
 
 
 if __name__ == "__main__":
