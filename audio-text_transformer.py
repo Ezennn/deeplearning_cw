@@ -277,7 +277,7 @@ class Trainer:
                 data_load_end_time = time.time()
 
 
-                logits = self.model.forward(audio, text)
+                logits = self.model(audio, text)
 
                 #TASK 4 //done
 
@@ -368,12 +368,12 @@ class Trainer:
 
         self.summary_writer.add_scalars(
                 "accuracy",
-                {"test": accuracy},
+                {"val": accuracy},
                 self.step
         )
         self.summary_writer.add_scalars(
                 "loss",
-                {"test": average_loss},
+                {"val": average_loss},
                 self.step
         )
         print(f"validation loss: {average_loss:.5f}, accuracy: {accuracy * 100:2.2f}")
