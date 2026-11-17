@@ -62,6 +62,10 @@ def as_audio_tensor(value):
 
 def as_text_tensor(value):
     value = torch.as_tensor(value, dtype=torch.float32)
+
+    if value.ndim == 3 and value.shape[0] == 1:
+    	value = value.squeeze(0)
+
     if value.ndim != 2:
         raise ValueError(f"Expected [tokens, features] text tensor; got {tuple(value.shape)}")
     return value
