@@ -191,7 +191,7 @@ class AudioTextTransformer(nn.Module):
         
         self.classifier = nn.Sequential(
             nn.Linear(d_model, 128),
-            nn.GELU(),
+            nn.LayerNorm(d_model), 
             nn.Dropout(dropout),
             nn.Linear(128, 2) 
         )
@@ -330,10 +330,11 @@ class Trainer:
 
         # No need to track gradients for validation, we're not optimizing.
         with torch.no_grad():
-            for batch, labels in self.val_loader:
-                batch = batch.to(self.device)
+            for audio, text, labels in self.val_loader:
+                audio = audio.to(self.device)
+                text = text.to(self.device)
                 labels = labels.to(self.device)
-                logits = self.model(batch)
+                logits = self.model(audio, text)
                 loss = self.criterion(logits, labels)
                 total_loss += loss.item()
                 preds = logits.argmax(dim=-1).cpu().numpy()
