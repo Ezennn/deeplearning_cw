@@ -14,6 +14,9 @@ from torch.optim.optimizer import Optimizer
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
 
+import random
+from collections import Counter
+
 import argparse
 from pathlib import Path
 
@@ -34,6 +37,7 @@ parser.add_argument("--log-frequency", default=10, type=int)
 parser.add_argument("--print-frequency", default=10, type=int)
 parser.add_argument("-j", "--worker-count", default=0, type=int,
                     help="Data loader workers; 0 avoids copying large feature dictionaries")
+parser.add_argument("--seed", default=42, type=int, help="Seed number for randomisation - type in your lucky number")
 
 # Adjustable parametres for training
 MODEL_DIM = 256
@@ -43,6 +47,17 @@ NEGATIVES_PER_POSITIVE = 1
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+    torch.use_deterministic_algorithms(True)
 
 def load_features(root: Path, split: str):
     audio = torch.load(root / f"{split}_audio_features.pt", map_location="cpu", weights_only=False)
@@ -120,7 +135,11 @@ class AudioTextDataset(Dataset):
                 torch.tensor(label, dtype=torch.long))
 
 
+
+
 def main(args):
+    set_seed(args.seed)
+    
     train_audio, train_text, train_labels = load_features(args.dataset_root, "train")
     val_audio, val_text, val_labels = load_features(args.dataset_root, "val")
     train_dataset = AudioTextDataset(train_audio, train_text, train_labels, training=True)
@@ -128,8 +147,21 @@ def main(args):
 
     train_loader = DataLoader(train_dataset, shuffle=True, batch_size=args.batch_size,
                               pin_memory=True, num_workers=args.worker_count)
+
+    print("Training dataset size:", len(train_dataset))
+    print("Training batches:", len(train_loader))
+    
+    audio, text, labels = next(iter(train_loader))
+    
+    print("Audio batch shape:", audio.shape)
+    print("Text batch shape:", text.shape)
+    print("Labels shape:", labels.shape)
+
+    
     val_loader = DataLoader(val_dataset, shuffle=False, batch_size=args.batch_size,
-                            pin_memory=True, num_workers=args.worker_count)
+                            pin_memory=True, num_workers=args.worker_count,
+                            worker_init_fn=lambda worker_id: np.random.seed(torch.initial_seed() % (2**32))
+                           )
 
     first_audio, first_text, _ = train_dataset[0]
     model = AudioTextTransformer(audio_dim=first_audio.shape[-1],
@@ -147,43 +179,50 @@ def main(args):
     trainer.train(args.epochs, args.val_frequency,
                   print_frequency=args.print_frequency,
                   log_frequency=args.log_frequency)
+
+    torch.save(trainer.model.state_dict(), "transformer_weights.pth")
+    
     summary_writer.close()
-
-# class Attention(nn.Module):
-#     def __init__(self, dim=192, num_heads=1):
-#         super().__init__()
-#         self.num_heads = num_heads
-#         self.head_dim = dim // num_heads
-#         self.scale = self.head_dim ** -0.5
-
-#         self.qkv = nn.Linear(dim, dim * 3, bias=False)
-
-#         self.proj = nn.Linear(dim, dim)
-
-#     def forward(self, x):
-#         B, S, D = x.shape
-
-#         qkv = self.qkv(x).reshape(B, S, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-#         q, k, v = qkv[0], qkv[1], qkv[2]
-
-#         # TASK 12.1: Scale queries
-#         q = q * self.scale
-
-#         # TASK 12.2: Multiply queries by transposed keys
-#         attn = q @ k.transpose(-2, -1)
-
-#         # TASK 12.3: Apply softmax
-#         attn = F.softmax(attn, dim=-1)
-
-#         # TASK 12.4: Multiply attention by values and concatenate heads
-#         x = attn @ v
-#         x = x.transpose(1, 2).reshape(B, S, D)
-#         x = self.proj(x)
-#         return x
 
 class AudioTextTransformer(nn.Module):
     def __init__(
-        self,
+        self,#!/usr/bin/env python3
+from __future__ import annotations
+import time
+from multiprocessing import cpu_count
+from typing import Union, NamedTuple
+import sys
+
+import torch
+import torch.backends.cudnn
+import numpy as np
+from torch import nn, optim
+from torch.nn import functional as F
+from torch.optim.optimizer import Optimizer
+from torch.utils.data import DataLoader, Dataset
+from torch.utils.tensorboard import SummaryWriter
+
+import argparse
+from pathlib import Path
+
+torch.backends.cudnn.benchmark = True
+
+parser = argparse.ArgumentParser(
+    description="Train an Audio-Text Matching Transformer",
+    formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+)
+parser.add_argument("--dataset-root", default=Path("/data/COMS30017"), type=Path)
+parser.add_argument("--log-dir", default=Path("logs"), type=Path)
+parser.add_argument("--learning-rate", default=1e-3, type=float, help="Learning rate")
+parser.add_argument("--num-heads", default=4, type=int, help="Number of Heads")
+parser.add_argument("--batch-size", default=128, type=int, help="Number of pairs per mini-batch")
+parser.add_argument("--epochs", default=10, type=int)
+parser.add_argument("--val-frequency", default=2, type=int)
+parser.add_argument("--log-frequency", default=10, type=int)
+parser.add_argument("--print-frequency", default=10, type=int)
+parser.add_argument("-j", "--worker-count", default=0, type=int,
+                    help="Data loader workers; 0 avoids copying large feature dictionaries")
+
         audio_dim,
         text_dim,
         d_model=256,
