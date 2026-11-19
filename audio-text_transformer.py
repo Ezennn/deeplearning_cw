@@ -16,7 +16,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 import random
 from collections import Counter
-
+import matplotlib.pyplot as plt
 import argparse
 from pathlib import Path
 
@@ -58,6 +58,38 @@ def set_seed(seed):
     torch.backends.cudnn.benchmark = False
 
     torch.use_deterministic_algorithms(True)
+
+
+def plot_training_history(trainer):
+
+    output_dir = Path("training_graphs")
+    output_dir.mkdir(exist_ok=True)
+
+    # Loss per batch
+    plt.figure(figsize=(10, 5))
+    plt.plot(trainer.batch_losses)
+    plt.xlabel("Batch")
+    plt.ylabel("Loss")
+    plt.title("Training Loss Over Batches")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(output_dir / "batch_loss.png")
+    plt.close()
+
+    # Accuracy per batch
+    plt.figure(figsize=(10, 5))
+    plt.plot(trainer.batch_accuracies)
+    plt.xlabel("Batch")
+    plt.ylabel("Accuracy")
+    plt.title("Training Accuracy Over Batches")
+    plt.ylim(0, 1)
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(output_dir / "batch_accuracy.png")
+    plt.close()
+
+    print(f"Training graphs saved to {output_dir}")
+
 
 def load_features(root: Path, split: str):
     audio = torch.load(root / f"{split}_audio_features.pt", map_location="cpu", weights_only=False)
@@ -175,7 +207,7 @@ def main(args):
     trainer.train(args.epochs, args.val_frequency,
                   print_frequency=args.print_frequency,
                   log_frequency=args.log_frequency)
-    
+    plot_training_history(trainer)
     torch.save(trainer.model.state_dict(), "transformer_weights.pth")
     
     summary_writer.close()
@@ -229,7 +261,7 @@ class AudioTextTransformer(nn.Module):
         x = torch.cat((audio, text), dim=1)
         x = self.transformer(x)
         
-        #Mean pooling (GAP) over the sequence dimension
+        #Mean pooling (GAP) over the sequence dimension -Attention Pooling
         x = x.mean(dim=1)
         output = self.classifier(x)
         return output
@@ -255,6 +287,14 @@ class Trainer:
         self.optimizer = optimizer
         self.summary_writer = summary_writer
         self.step = 0
+        self.batch_losses = []
+        self.batch_accuracies = []
+        
+        self.train_losses = []
+        self.train_accuracies = []
+        
+        self.val_losses = []
+        self.val_accuracies = []
 
     def train(
         self,
@@ -308,6 +348,12 @@ class Trainer:
 
                 self.step += 1
                 data_load_start_time = time.time()
+                self.batch_losses.append(loss.item())
+
+                predictions = logits.argmax(dim=1)
+                accuracy = (predictions == labels).float().mean().item()
+                
+                self.batch_accuracies.append(accuracy)
 
             self.summary_writer.add_scalar("epoch", epoch, self.step)
             if ((epoch + 1) % val_frequency) == 0:
