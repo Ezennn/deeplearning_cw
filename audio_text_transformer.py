@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-from __future__ import annotations
+# from __future__ import annotations
 import time
 from multiprocessing import cpu_count
 from typing import Union, NamedTuple
@@ -215,6 +215,9 @@ class AudioTextTransformer(nn.Module):
         pooling: str="mean",
     ):
         super().__init__()
+
+        self.pooling = pooling
+        
         self.audio_projection = nn.Sequential(
             nn.Linear(audio_dim, d_model),
             nn.GELU(),
