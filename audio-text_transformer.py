@@ -28,7 +28,7 @@ parser.add_argument("--log-dir", default=Path("logs"), type=Path)
 parser.add_argument("--learning-rate", default=1e-3, type=float, help="Learning rate")
 parser.add_argument("--num-heads", default=4, type=int, help="Number of Heads")
 parser.add_argument("--batch-size", default=128, type=int, help="Number of pairs per mini-batch")
-parser.add_argument("--epochs", default=3, type=int)
+parser.add_argument("--epochs", default=10, type=int)
 parser.add_argument("--val-frequency", default=2, type=int)
 parser.add_argument("--log-frequency", default=10, type=int)
 parser.add_argument("--print-frequency", default=10, type=int)
@@ -64,8 +64,9 @@ def as_text_tensor(value):
     value = torch.as_tensor(value, dtype=torch.float32)
 
     if value.ndim == 3 and value.shape[0] == 1:
-    	value = value.squeeze(0)
-
+        value = value.squeeze(0)
+     
+    
     if value.ndim != 2:
         raise ValueError(f"Expected [tokens, features] text tensor; got {tuple(value.shape)}")
     return value
@@ -215,7 +216,8 @@ class AudioTextTransformer(nn.Module):
         
         self.classifier = nn.Sequential(
             nn.Linear(d_model, 128),
-            nn.LayerNorm(128), 
+            nn.LayerNorm(128),
+            nn.ReLU(), 
             nn.Dropout(dropout),
             nn.Linear(128, 2) 
         )
@@ -228,7 +230,7 @@ class AudioTextTransformer(nn.Module):
         x = torch.cat((audio, text), dim=1)
         x = self.transformer(x)
         
-        #Mean pooling
+        #Mean pooling (GAP) over the sequence dimension
         x = x.mean(dim=1)
         output = self.classifier(x)
         return output
