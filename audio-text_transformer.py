@@ -340,6 +340,15 @@ class Trainer:
         self.summary_writer = summary_writer
         self.step = 0
         self.model_name = model_name
+        
+        self.history = {
+            "train_epochs": [],
+            "train_loss": [],
+            "train_accuracy": [],
+            "val_epochs": [],
+            "val_loss": [],
+            "val_accuracy": []
+        }
 
     def train(
         self,
