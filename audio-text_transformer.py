@@ -38,6 +38,8 @@ parser.add_argument("--print-frequency", default=10, type=int)
 parser.add_argument("-j", "--worker-count", default=0, type=int,
                     help="Data loader workers; 0 avoids copying large feature dictionaries")
 parser.add_argument("--seed", default=42, type=int, help="Seed number for randomisation")
+parser.add_argument("--pooling", default="mean", choices=["mean", "attn"],
+                    help="Pooling over transformer outputs")
 
 # Adjustable parametres for training
 MODEL_DIM = 256
@@ -163,7 +165,7 @@ def main(args):
     model = AudioTextTransformer(audio_dim=first_audio.shape[-1],
                                  text_dim=first_text.shape[-1],
                                  d_model=MODEL_DIM, num_heads=args.num_heads,
-                                 mlp_dim=TRANSFORMER_MLP_DIM, dropout=DROPOUT)
+                                 mlp_dim=TRANSFORMER_MLP_DIM, dropout=DROPOUT, pooling=args.pooling)
     criterion = nn.CrossEntropyLoss()  # Existing classifier outputs two logits.
     optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
 
@@ -175,10 +177,28 @@ def main(args):
     trainer.train(args.epochs, args.val_frequency,
                   print_frequency=args.print_frequency,
                   log_frequency=args.log_frequency)
-    
-    torch.save(trainer.model.state_dict(), "transformer_weights.pth")
+
+    weights_file = "transformer_weights.pth" if args.pooling == "mean" else "transformer_attn_weights.pth"
+    torch.save(trainer.model.state_dict(), weights_file)
+    # torch.save(trainer.model.state_dict(), "transformer_weights.pth")
     
     summary_writer.close()
+
+class AttentionPooling(nn.Module):
+    def __init__(self, d_model, hidden=128, dropout=0.1):
+        super().__init__()
+        self.score = nn.Sequential(
+            nn.Linear(d_model, hidden),
+            nn.Tanh(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, 1),
+        )
+
+    def forward(self, x):                      # x: [B, T, D]
+        w = self.score(x).squeeze(-1)          # [B, T]
+        w = torch.softmax(w, dim=1)            # attention weights over tokens
+        pooled = torch.bmm(w.unsqueeze(1), x).squeeze(1)   # [B, D]
+        return pooled, w
 
 class AudioTextTransformer(nn.Module):
     def __init__(
@@ -188,7 +208,8 @@ class AudioTextTransformer(nn.Module):
         d_model=256,
         num_heads=4,
         mlp_dim=512,
-        dropout=0.1
+        dropout=0.1,
+        pooling="mean",
     ):
         super().__init__()
         self.audio_projection = nn.Sequential(
@@ -220,6 +241,10 @@ class AudioTextTransformer(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(128, 2) 
         )
+
+        self.pooling = pooling
+        if pooling == "attn":
+            self.pool = AttentionPooling(d_model, dropout=dropout)
     
     def forward(self, audio_input, text_input):
         audio = self.audio_projection(audio_input)
@@ -230,7 +255,12 @@ class AudioTextTransformer(nn.Module):
         x = self.transformer(x)
         
         #Mean pooling (GAP) over the sequence dimension
-        x = x.mean(dim=1)
+        if self.pooling == "attn":
+            x, w = self.pool(x)
+            self.last_attn = w.detach()   # detached copy of the weights, for plotting later
+        else:
+            x = x.mean(dim=1)
+            
         output = self.classifier(x)
         return output
     
