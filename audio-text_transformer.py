@@ -39,6 +39,9 @@ parser.add_argument("-j", "--worker-count", default=0, type=int,
                     help="Data loader workers; 0 avoids copying large feature dictionaries")
 parser.add_argument("--seed", default=42, type=int, help="Seed number for randomisation")
 
+#added this so multiple experiments could be run and logged to different direcctories for easier comparison
+parser.add_argument("--model-name", type=str, default="baseline", help="Name of the model experiment")
+
 # Adjustable parametres for training
 MODEL_DIM = 256
 TRANSFORMER_MLP_DIM = 512
@@ -171,7 +174,7 @@ def main(args):
     print(f"Writing logs to {log_dir}")
     summary_writer = SummaryWriter(str(log_dir), flush_secs=5)
     trainer = Trainer(model, train_loader, val_loader, criterion, optimizer,
-                      summary_writer, DEVICE)
+                      summary_writer, DEVICE, model_name=args.model_name)
     trainer.train(args.epochs, args.val_frequency,
                   print_frequency=args.print_frequency,
                   log_frequency=args.log_frequency)
@@ -246,6 +249,7 @@ class Trainer:
         optimizer: Optimizer,
         summary_writer: SummaryWriter,
         device: torch.device,
+        model_name: str = "baseline"
     ):
         self.model = model.to(device)
         self.device = device
@@ -255,6 +259,7 @@ class Trainer:
         self.optimizer = optimizer
         self.summary_writer = summary_writer
         self.step = 0
+        self.model_name = model_name
 
     def train(
         self,
@@ -310,6 +315,18 @@ class Trainer:
                 data_load_start_time = time.time()
 
             self.summary_writer.add_scalar("epoch", epoch, self.step)
+            
+            if (epoch + 1) % 5 == 0:
+                save_dir = Path(self.model_name) / "weights"
+                save_dir.mkdir(parents=True, exist_ok=True)
+                save_path = save_dir / f"epoch_{epoch + 1}.pth"
+                torch.save({
+                    "epoch": epoch + 1,
+                    "model_state_dict": self.model.state_dict(),
+                    "optimizer_state_dict": self.optimizer.state_dict(),
+                }, save_path)
+                print(f"Checkpoint saved: {save_path}")
+                
             if ((epoch + 1) % val_frequency) == 0:
                 self.validate()
 
