@@ -4,6 +4,7 @@ import time
 from multiprocessing import cpu_count
 from typing import Union, NamedTuple
 import sys
+import json
 
 import torch
 import torch.backends.cudnn
@@ -15,7 +16,6 @@ from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
 
 import random
-import json
 from collections import Counter
 
 import argparse
@@ -44,11 +44,15 @@ parser.add_argument("--seed", default=42, type=int, help="Seed number for random
 #added this so multiple experiments could be run and logged to different direcctories for easier comparison
 parser.add_argument("--model-name", type=str, default="baseline", help="Name of the model experiment")
 
-# Optimiser choice (added for the AdamW extension)
-parser.add_argument("--optimizer", default="adam", choices=["adam", "adamw"],
-                    help="adam = baseline, adamw = decoupled weight decay")
-parser.add_argument("--weight-decay", default=0.01, type=float,
-                    help="Weight decay (only used by adamw; not applied to biases/LayerNorm)")
+# Optimiser choice + sustainability tracking (added for the extension)
+parser.add_argument("--optimizer", type=str, default="adam", choices=["adam", "adamw"],
+                    help="Optimiser to use")
+parser.add_argument("--weight-decay", default=1e-2, type=float,
+                    help="Decoupled weight decay (AdamW only)")
+parser.add_argument("--weights-path", type=Path, default=Path("transformer_weights.pth"),
+                    help="Where to save the final weights (change per experiment so runs don't overwrite each other)")
+parser.add_argument("--target-accuracy", default=0.60, type=float,
+                    help="Validation accuracy used to measure epochs-to-target")
 
 # Adjustable parametres for training
 MODEL_DIM = 256
@@ -57,71 +61,6 @@ DROPOUT = 0.1
 NEGATIVES_PER_POSITIVE = 1
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-def count_parameters(model: nn.Module) -> int:
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-
-def build_optimizer(model: nn.Module, name: str, lr: float, weight_decay: float) -> Optimizer:
-    """Adam (baseline) or AdamW.
-
-    AdamW applies weight decay directly to the weights (decoupled from the
-    gradient/Adam statistics). Following common practice, 1-D parameters
-    (biases and LayerNorm gains) are excluded from decay.
-    """
-    if name == "adam":
-        return optim.Adam(model.parameters(), lr=lr)
-    decay, no_decay = [], []
-    for _, p in model.named_parameters():
-        if p.requires_grad:
-            (no_decay if p.ndim <= 1 else decay).append(p)
-    return optim.AdamW(
-        [{"params": decay, "weight_decay": weight_decay},
-         {"params": no_decay, "weight_decay": 0.0}],
-        lr=lr,
-    )
-
-
-def forward_flops_per_sample(model: nn.Module, audio, text):
-    """Hardware-independent compute estimate: forward FLOPs for ONE pair.
-
-    Run in train mode on purpose: in eval mode PyTorch may use a fused
-    TransformerEncoderLayer kernel that the FLOP counter cannot see.
-    Training cost is roughly 3x forward (forward + backward).
-    """
-    try:
-        from torch.utils.flop_counter import FlopCounterMode
-        model.train()
-        with torch.no_grad(), FlopCounterMode(display=False) as counter:
-            model(audio[:1].to(DEVICE), text[:1].to(DEVICE))
-        return int(counter.get_total_flops())
-    except Exception as e:  # old torch version etc.
-        print(f"FLOP counting unavailable: {e}")
-        return None
-
-
-class EnergyMeter:
-    """GPU energy via NVML's cumulative counter (Volta or newer). Returns None
-    if unavailable (CPU run, no pynvml, old GPU). NOTE: only covers the GPU,
-    not CPU/RAM, and assumes torch's device index matches NVML's."""
-
-    def __init__(self):
-        self.handle = None
-        if torch.cuda.is_available():
-            try:
-                import pynvml
-                pynvml.nvmlInit()
-                self._nvml = pynvml
-                self.handle = pynvml.nvmlDeviceGetHandleByIndex(torch.cuda.current_device())
-                pynvml.nvmlDeviceGetTotalEnergyConsumption(self.handle)  # test call
-            except Exception:
-                self.handle = None
-
-    def read_joules(self):
-        if self.handle is None:
-            return None
-        return self._nvml.nvmlDeviceGetTotalEnergyConsumption(self.handle) / 1000.0  # mJ -> J
 
 
 def save_training_curves(history, model_name):
@@ -320,46 +259,63 @@ def main(args):
                                  d_model=MODEL_DIM, num_heads=args.num_heads,
                                  mlp_dim=TRANSFORMER_MLP_DIM, dropout=DROPOUT)
     criterion = nn.CrossEntropyLoss()  # Existing classifier outputs two logits.
-    optimizer = build_optimizer(model, args.optimizer, args.learning_rate, args.weight_decay)
+    if args.optimizer == "adamw":
+        # Decoupled weight decay on weight matrices only (not biases / LayerNorm params)
+        decay = [p for p in model.parameters() if p.ndim >= 2]
+        no_decay = [p for p in model.parameters() if p.ndim < 2]
+        optimizer = optim.AdamW(
+            [{"params": decay, "weight_decay": args.weight_decay},
+             {"params": no_decay, "weight_decay": 0.0}],
+            lr=args.learning_rate
+        )
+    else:
+        optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
 
     log_dir = get_summary_writer_log_dir(args)
     print(f"Writing logs to {log_dir}")
     summary_writer = SummaryWriter(str(log_dir), flush_secs=5)
     trainer = Trainer(model, train_loader, val_loader, criterion, optimizer,
                       summary_writer, DEVICE, model_name=args.model_name)
-    fwd_flops = forward_flops_per_sample(trainer.model, audio, text)
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+    train_start = time.perf_counter()
     trainer.train(args.epochs, args.val_frequency,
                   print_frequency=args.print_frequency,
                   log_frequency=args.log_frequency)
-    
-    # Each experiment saves into its own folder so runs don't overwrite each other.
-    out_dir = Path(args.model_name)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    torch.save(trainer.model.state_dict(), out_dir / "transformer_weights.pth")
+    train_time = time.perf_counter() - train_start
 
-    # Efficiency metrics, read back by the notebook for the sustainability comparison.
-    h = trainer.history
-    energy = [e for e in h["epoch_energy_j"] if e is not None]
+    torch.save(trainer.model.state_dict(), args.weights_path)
+
+    # Sustainability metrics (validation split only, never the test split)
+    hist = trainer.history
+    best_idx = int(np.argmax(hist["val_accuracy"]))
+    reached = [e for e, a in zip(hist["val_epochs"], hist["val_accuracy"])
+               if a >= args.target_accuracy]
     metrics = {
         "model_name": args.model_name,
         "optimizer": args.optimizer,
-        "learning_rate": args.learning_rate,
         "weight_decay": args.weight_decay if args.optimizer == "adamw" else 0.0,
-        "seed": args.seed,
+        "learning_rate": args.learning_rate,
         "epochs": args.epochs,
-        "batch_size": args.batch_size,
-        "trainable_params": count_parameters(trainer.model),
-        "samples_per_epoch": len(train_dataset),
-        "fwd_flops_per_sample": fwd_flops,
-        "peak_gpu_mem_mb": (torch.cuda.max_memory_allocated() / 2**20) if torch.cuda.is_available() else None,
-        "total_train_seconds": float(sum(h["epoch_train_time"])),
-        "total_energy_j": float(sum(energy)) if len(energy) == len(h["epoch_energy_j"]) and energy else None,
-        "history": h,
+        "parameters": sum(p.numel() for p in model.parameters() if p.requires_grad),
+        "train_time_s": train_time,
+        "time_per_epoch_s": train_time / args.epochs,
+        "peak_gpu_mem_mb": (torch.cuda.max_memory_allocated() / 2**20
+                            if torch.cuda.is_available() else None),
+        "best_val_accuracy": hist["val_accuracy"][best_idx],
+        "best_val_epoch": hist["val_epochs"][best_idx],
+        "final_val_accuracy": hist["val_accuracy"][-1],
+        "final_val_loss": hist["val_loss"][-1],
+        "target_accuracy": args.target_accuracy,
+        "epochs_to_target": reached[0] if reached else None,
+        "history": hist,
     }
+    out_dir = Path(args.model_name)
+    out_dir.mkdir(parents=True, exist_ok=True)
     with open(out_dir / "metrics.json", "w") as f:
         json.dump(metrics, f, indent=2)
-    print(f"Saved weights + metrics to {out_dir}/")
-
+    print(f"Training time: {train_time:.1f}s, metrics saved to {out_dir / 'metrics.json'}")
+    
     summary_writer.close()
 
 class AudioTextTransformer(nn.Module):
@@ -446,12 +402,8 @@ class Trainer:
             "train_accuracy": [],
             "val_epochs": [],
             "val_loss": [],
-            "val_accuracy": [],
-            # efficiency tracking (training only, validation time excluded)
-            "epoch_train_time": [],
-            "epoch_energy_j": [],
+            "val_accuracy": []
         }
-        self.energy_meter = EnergyMeter()
 
     def train(
         self,
@@ -462,8 +414,9 @@ class Trainer:
         start_epoch: int = 0
     ):
         self.model.train()
-        if self.device.type == "cuda":
-            torch.cuda.reset_peak_memory_stats()
+        #TASK 5
+        def count_parameters(model: nn.Module) -> int:
+            return sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"Number of trainable parameters: {count_parameters(self.model):,}")
         
         for epoch in range(start_epoch, epochs):
@@ -471,9 +424,6 @@ class Trainer:
             epoch_correct = 0
             epoch_samples = 0
             self.model.train()
-            self._sync()
-            epoch_start = time.perf_counter()
-            energy_start = self.energy_meter.read_joules()
             data_load_start_time = time.time()
             for audio, text, labels in self.train_loader:
                 audio = audio.to(self.device)
@@ -517,13 +467,6 @@ class Trainer:
                 self.step += 1
                 data_load_start_time = time.time()
                 
-            self._sync()
-            self.history["epoch_train_time"].append(time.perf_counter() - epoch_start)
-            energy_end = self.energy_meter.read_joules()
-            self.history["epoch_energy_j"].append(
-                None if energy_start is None or energy_end is None else energy_end - energy_start
-            )
-
             average_train_loss = epoch_loss / epoch_samples
             epoch_train_accuracy = epoch_correct / epoch_samples
 
@@ -563,11 +506,6 @@ class Trainer:
                 self.model.train()
                 
         save_training_curves(self.history, self.model_name)
-
-    def _sync(self):
-        # make GPU timing accurate
-        if self.device.type == "cuda":
-            torch.cuda.synchronize()
 
     def print_metrics(self, epoch, accuracy, loss, data_load_time, step_time):
         epoch_step = self.step % len(self.train_loader)
