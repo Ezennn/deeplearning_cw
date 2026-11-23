@@ -517,6 +517,7 @@ class Trainer:
                 self.step
         )
         print(f"validation loss: {average_loss:.5f}, accuracy: {accuracy * 100:2.2f}")
+        return average_loss, accuracy
 
 
 
