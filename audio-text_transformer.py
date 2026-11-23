@@ -175,7 +175,7 @@ class AudioTextDataset(Dataset):
         self.audio = audio
         self.text = text
         self.training = training
-        self.keys = list(audio.keys() & text.keys())
+        self.keys = sorted(audio.keys() & text.keys())  # deterministic order across runs
         if not self.keys:
             raise ValueError("No shared audio/text split IDs")
         if training:
