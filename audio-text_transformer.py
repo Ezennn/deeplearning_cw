@@ -19,6 +19,7 @@ from collections import Counter
 
 import argparse
 from pathlib import Path
+import matplotlib.pyplot as plt
 
 torch.backends.cudnn.benchmark = True
 
@@ -49,6 +50,85 @@ DROPOUT = 0.1
 NEGATIVES_PER_POSITIVE = 1
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def save_training_curves(history, model_name):
+    """
+    Save training/validation loss and accuracy curves.
+
+    Args:
+        history: Dictionary containing epoch-level metrics.
+        model_name: Experiment directory name, e.g. baseline.
+    """
+
+    figure_dir = Path(model_name) / "figure"
+    figure_dir.mkdir(parents=True, exist_ok=True)
+
+    plt.figure(figsize=(8, 5))
+
+    plt.plot(
+        history["train_epochs"],
+        history["train_loss"],
+        label="Training Loss",
+        marker="o"
+    )
+
+    plt.plot(
+        history["val_epochs"],
+        history["val_loss"],
+        label="Validation Loss",
+        marker="o"
+    )
+
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("Training vs Validation Loss")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    plt.savefig(
+        figure_dir / "training_validation_loss.png",
+        dpi=300,
+        bbox_inches="tight"
+    )
+    plt.close()
+
+    # -------------------------
+    # 2. Training vs validation accuracy
+    # -------------------------
+    plt.figure(figsize=(8, 5))
+
+    plt.plot(
+        history["train_epochs"],
+        [x * 100 for x in history["train_accuracy"]],
+        label="Training Accuracy",
+        marker="o"
+    )
+
+    plt.plot(
+        history["val_epochs"],
+        [x * 100 for x in history["val_accuracy"]],
+        label="Validation Accuracy",
+        marker="o"
+    )
+
+    plt.xlabel("Epoch")
+    plt.ylabel("Accuracy (%)")
+    plt.title("Training vs Validation Accuracy")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    plt.savefig(
+        figure_dir / "training_validation_accuracy.png",
+        dpi=300,
+        bbox_inches="tight"
+    )
+    plt.close()
+
+    print(f"Training figures saved to: {figure_dir}")
+
 
 def set_seed(seed):
     random.seed(seed)
@@ -276,6 +356,9 @@ class Trainer:
         print(f"Number of trainable parameters: {count_parameters(self.model):,}")
         
         for epoch in range(start_epoch, epochs):
+            epoch_loss = 0.0
+            epoch_correct = 0
+            epoch_samples = 0
             self.model.train()
             data_load_start_time = time.time()
             for audio, text, labels in self.train_loader:
@@ -299,10 +382,16 @@ class Trainer:
 
                 self.optimizer.step()
                 
+                batch_size = labels.size(0)
 
                 with torch.no_grad():
                     preds = logits.argmax(-1)
                     accuracy = compute_accuracy(labels, preds)
+                
+                #accumulate epoch-level metrics
+                epoch_loss += loss.item() * batch_size
+                epoch_correct += (preds == labels).sum().item()
+                epoch_samples += batch_size
 
                 data_load_time = data_load_end_time - data_load_start_time
                 step_time = time.time() - data_load_end_time
@@ -313,9 +402,23 @@ class Trainer:
 
                 self.step += 1
                 data_load_start_time = time.time()
+                
+            average_train_loss = epoch_loss / epoch_samples
+            epoch_train_accuracy = epoch_correct / epoch_samples
 
+            self.history["train_epochs"].append(epoch + 1)
+            self.history["train_loss"].append(average_train_loss)
+            self.history["train_accuracy"].append(epoch_train_accuracy)
+
+            print(
+                f"Epoch [{epoch + 1}], "
+                f"Training Loss: {average_train_loss:.5f}, "
+                f"Training Accuracy: {epoch_train_accuracy * 100:.2f}%"
+            )
+            
             self.summary_writer.add_scalar("epoch", epoch, self.step)
             
+            #checkpointing the model every 5 epochs
             if (epoch + 1) % 5 == 0:
                 save_dir = Path(self.model_name) / "weights"
                 save_dir.mkdir(parents=True, exist_ok=True)
@@ -328,11 +431,17 @@ class Trainer:
                 print(f"Checkpoint saved: {save_path}")
                 
             if ((epoch + 1) % val_frequency) == 0:
-                self.validate()
+                val_loss, val_accuracy = self.validate()
 
+                self.history["val_epochs"].append(epoch + 1)
+                self.history["val_loss"].append(val_loss)
+                self.history["val_accuracy"].append(val_accuracy)
+                        
                 # self.validate() will put the model in validation mode,
                 # so we have to switch back to train mode afterwards
                 self.model.train()
+                
+        save_training_curves(self.history, self.model_name)
 
     def print_metrics(self, epoch, accuracy, loss, data_load_time, step_time):
         epoch_step = self.step % len(self.train_loader)
